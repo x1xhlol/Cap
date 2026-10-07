@@ -4,7 +4,7 @@ import { createEventListener } from "@solid-primitives/event-listener";
 import { createElementSize } from "@solid-primitives/resize-observer";
 import { makePersisted } from "@solid-primitives/storage";
 import { useSearchParams } from "@solidjs/router";
-import { createMutation, useQuery } from "@tanstack/solid-query";
+import { useQuery } from "@tanstack/solid-query";
 import {
 	LogicalPosition,
 	type PhysicalPosition,
@@ -17,7 +17,7 @@ import {
 	MenuItem,
 	PredefinedMenuItem,
 } from "@tauri-apps/api/menu";
-import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import type { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { type as ostype } from "@tauri-apps/plugin-os";
 import {
 	createEffect,
@@ -78,9 +78,12 @@ import { createDevicesQuery } from "~/utils/devices";
 import { shouldConfirmRecordingWithoutMicrophone } from "~/utils/general-settings";
 import {
 	createCameraMutation,
+	createMicrophoneMutation,
 	createOptionsQuery,
 	createOrganizationsQuery,
 } from "~/utils/queries";
+import { isRecordingStartCancelled } from "~/utils/recording";
+import { createRecordingMenuPopup } from "~/utils/recording-menu";
 import {
 	type CanvasControls,
 	createImageDataWS,
@@ -194,7 +197,8 @@ function Inner() {
 	const [params] = useSearchParams<{
 		displayId: DisplayId;
 		isHoveredDisplay: string;
-		targetMode: "display" | "window" | "area" | "camera";
+		targetMode: "display" | "window" | "area" | "camera" | "ocr";
+		overlayInstance: string;
 	}>();
 	const [options, setOptions] = useOptions();
 	const [areaSelectionPreferences, setAreaSelectionPreferences] = makePersisted(
@@ -210,6 +214,12 @@ function Inner() {
 	onMount(() => {
 		if (params.targetMode) {
 			setOptions("targetMode", params.targetMode);
+		}
+		const instance = Number(params.overlayInstance);
+		if (Number.isSafeInteger(instance) && instance > 0) {
+			void commands.targetSelectOverlayReady(instance).catch((error) => {
+				console.error("Failed to prepare target picker", error);
+			});
 		}
 	});
 
@@ -293,7 +303,16 @@ function Inner() {
 	});
 
 	createEffect(
-		(prevMode: "display" | "window" | "area" | "camera" | null | undefined) => {
+		(
+			prevMode:
+				| "display"
+				| "window"
+				| "area"
+				| "camera"
+				| "ocr"
+				| null
+				| undefined,
+		) => {
 			const mode = options.targetMode ?? null;
 			if (prevMode === "area" && mode !== "area") {
 				const target = pendingAreaTarget();
@@ -342,12 +361,6 @@ function Inner() {
 		}
 	});
 
-	const unsubOnEscapePress = events.onEscapePress.listen(() => {
-		setOptions({ targetMode: null, targetModeDismissal: "cancelled" });
-		commands.closeTargetSelectOverlays();
-	});
-	onCleanup(() => unsubOnEscapePress.then((f) => f()));
-
 	// Dismiss the picker because a recording is starting. The dismissal reason
 	// rides along with `targetMode: null` so the main window never has to guess
 	// (from possibly-stale query state) whether it may reveal itself again.
@@ -355,28 +368,7 @@ function Inner() {
 		if (options.mode === "screenshot") return;
 		const targetModeDismissal =
 			options.mode === "instant" ? "recordingInstant" : "recordingStudio";
-		if (options.targetModeSource === "editor") {
-			setOptions({
-				targetMode: null,
-				targetModeSource: "editorRecording",
-				targetModeDismissal,
-			});
-		} else {
-			setOptions({ targetMode: null, targetModeDismissal });
-		}
-		// Hide rather than close: startRecording is invoked from THIS webview right
-		// after dismissal, and closing destroys the webview before the invoke is
-		// dispatched — the recording then silently never starts. The backend closes
-		// these windows itself once the recording is underway, and the start handler
-		// closes them if the command fails.
-		void WebviewWindow.getAll().then((all) => {
-			for (const win of all) {
-				if (win.label.startsWith("target-select-overlay-")) {
-					void win.setIgnoreCursorEvents(true);
-					void win.hide();
-				}
-			}
-		});
+		setOptions({ targetMode: null, targetModeDismissal });
 	};
 
 	// This prevents browser keyboard shortcuts from firing.
@@ -700,18 +692,10 @@ function Inner() {
 														// so the screenshot silently never happens. The start
 														// handler hides these windows and closes them once the
 														// capture is done.
-														if (options.targetModeSource === "editor") {
-															setOptions({
-																targetMode: null,
-																targetModeSource: "editorRecording",
-																targetModeDismissal: "screenshot",
-															});
-														} else {
-															setOptions({
-																targetMode: null,
-																targetModeDismissal: "screenshot",
-															});
-														}
+														setOptions({
+															targetMode: null,
+															targetModeDismissal: "screenshot",
+														});
 													} else {
 														dismissPickerForRecordingStart();
 													}
@@ -779,8 +763,16 @@ function Inner() {
 					);
 				}}
 			</Match>
-			<Match when={options.targetMode === "area" && params.displayId}>
+			<Match
+				when={
+					(options.targetMode === "area" || options.targetMode === "ocr") &&
+					params.displayId
+				}
+			>
 				{(displayId) => {
+					const isOcr = () => options.targetMode === "ocr";
+					const isImmediateCapture = () =>
+						isOcr() || options.mode === "screenshot";
 					let controlsEl: HTMLDivElement | undefined;
 					let cropperRef: CropperRef | undefined;
 
@@ -812,31 +804,70 @@ function Inner() {
 					const [screenshotSnapToRatio, setScreenshotSnapToRatio] =
 						createSignal(true);
 					const minSize = () =>
-						options.mode === "screenshot" ? MIN_SCREENSHOT_SIZE : MIN_SIZE;
+						isImmediateCapture() ? MIN_SCREENSHOT_SIZE : MIN_SIZE;
 					const currentAspect = () =>
-						options.mode === "screenshot"
+						isImmediateCapture()
 							? screenshotAspect()
 							: areaSelectionPreferences.aspectRatio;
 					const currentSnapToRatio = () =>
-						options.mode === "screenshot"
+						isImmediateCapture()
 							? screenshotSnapToRatio()
 							: areaSelectionPreferences.snapToRatio;
 					const effectiveInitialAreaBounds = createMemo(() => {
 						const explicitBounds = initialAreaBounds();
 						if (explicitBounds) return explicitBounds;
-						if (options.mode === "screenshot") return undefined;
+						if (isImmediateCapture()) return undefined;
 						return getLockedAreaBounds(
 							areaSelectionPreferences,
 							displayId(),
 							minSize(),
 						);
 					});
+					const linux = ostype() === "linux";
+					const [localPointerInside, setLocalPointerInside] = createSignal<
+						boolean | undefined
+					>();
+					if (linux) {
+						const updateLocalPointer = (event: PointerEvent) => {
+							setLocalPointerInside(
+								event.clientX >= 0 &&
+									event.clientY >= 0 &&
+									event.clientX < window.innerWidth &&
+									event.clientY < window.innerHeight,
+							);
+						};
+						createEventListener(
+							window,
+							"pointerover",
+							updateLocalPointer,
+							true,
+						);
+						createEventListener(
+							window,
+							"pointermove",
+							updateLocalPointer,
+							true,
+						);
+						createEventListener(
+							window,
+							"pointerout",
+							(event) => {
+								if (event.relatedTarget === null) setLocalPointerInside(false);
+							},
+							true,
+						);
+						createEventListener(window, "blur", () =>
+							setLocalPointerInside(false),
+						);
+					}
 					const isActiveDisplay = createMemo(() => {
 						const activeDisplayId = targetUnderCursor.display_id;
-						if (activeDisplayId) {
+						if (activeDisplayId != null) {
 							return activeDisplayId === displayId();
 						}
-						return params.isHoveredDisplay === "true";
+						return linux
+							? (localPointerInside() ?? params.isHoveredDisplay === "true")
+							: params.isHoveredDisplay === "true";
 					});
 					const shouldShowOverlay = createMemo(
 						() => isInteracting() || isActiveDisplay(),
@@ -855,7 +886,7 @@ function Inner() {
 					});
 					const isSelectionLocked = createMemo(
 						() =>
-							options.mode !== "screenshot" &&
+							!isImmediateCapture() &&
 							getLockedAreaBounds(
 								areaSelectionPreferences,
 								displayId(),
@@ -864,7 +895,7 @@ function Inner() {
 					);
 
 					function setAspect(aspect: Ratio | null) {
-						if (options.mode === "screenshot") {
+						if (isImmediateCapture()) {
 							setScreenshotAspect(aspect);
 							return;
 						}
@@ -875,7 +906,7 @@ function Inner() {
 					}
 
 					function setSnapToRatio(enabled: boolean) {
-						if (options.mode === "screenshot") {
+						if (isImmediateCapture()) {
 							setScreenshotSnapToRatio(enabled);
 							return;
 						}
@@ -884,7 +915,7 @@ function Inner() {
 
 					function persistLockedSelection() {
 						if (
-							options.mode === "screenshot" ||
+							isImmediateCapture() ||
 							!areaSelectionPreferences.locked ||
 							areaSelectionPreferences.screenId !== displayId() ||
 							!isValid()
@@ -920,7 +951,7 @@ function Inner() {
 						}
 						if (
 							isInteracting() ||
-							options.mode === "screenshot" ||
+							isImmediateCapture() ||
 							!areaSelectionPreferences.locked ||
 							areaSelectionPreferences.screenId !== displayId() ||
 							!isValid() ||
@@ -989,7 +1020,7 @@ function Inner() {
 					});
 
 					createEffect(async () => {
-						if (options.mode === "screenshot") return;
+						if (isImmediateCapture()) return;
 						const bounds = crop();
 						const interacting = isInteracting();
 						const displayInfo = areaDisplayInfo.data;
@@ -1252,6 +1283,52 @@ function Inner() {
 
 						if (was && !interacting) {
 							persistLockedSelection();
+							if (isOcr() && isValid()) {
+								const cropBounds = crop();
+								const target: ScreenCaptureTarget = {
+									variant: "area",
+									screen: displayId(),
+									bounds: {
+										position: {
+											x: cropBounds.x,
+											y: cropBounds.y,
+										},
+										size: {
+											width: cropBounds.width,
+											height: cropBounds.height,
+										},
+									},
+								};
+
+								try {
+									await commands.suspendTargetSelectOverlays();
+									await new Promise((resolve) => setTimeout(resolve, 50));
+
+									await commands.captureOcrText(target);
+									setOptions({
+										targetMode: null,
+										targetModeDismissal: "ocr",
+									});
+									await commands.closeTargetSelectOverlays();
+								} catch (e) {
+									setOptions({
+										targetMode: null,
+										targetModeDismissal: "cancelled",
+									});
+									await commands
+										.closeTargetSelectOverlays()
+										.catch((error) =>
+											console.error(
+												"Failed to close target select overlays",
+												error,
+											),
+										);
+									const message = e instanceof Error ? e.message : String(e);
+									toast.error(`Failed to copy text: ${message}`);
+									console.error("Failed to copy text", e);
+								}
+								return;
+							}
 							if (options.mode === "screenshot" && isValid()) {
 								const cropBounds = crop();
 								const displayInfo = areaDisplayInfo.data;
@@ -1284,13 +1361,7 @@ function Inner() {
 								);
 
 								try {
-									const allWindows = await WebviewWindow.getAll();
-									for (const win of allWindows) {
-										if (win.label.startsWith("target-select-overlay-")) {
-											await win.setIgnoreCursorEvents(true);
-											await win.hide();
-										}
-									}
+									await commands.suspendTargetSelectOverlays();
 									await new Promise((resolve) => setTimeout(resolve, 50));
 
 									const path = await commands.takeScreenshot(target);
@@ -1330,7 +1401,9 @@ function Inner() {
 										<div class="min-w-28 px-2 text-base font-normal leading-none tracking-[-0.01em] tabular-nums">
 											{isValid()
 												? `${Math.round(crop().width)} × ${Math.round(crop().height)}`
-												: "Draw an area"}
+												: isOcr()
+													? "Draw an area to copy text"
+													: "Draw an area"}
 										</div>
 
 										<div class="h-6 w-px bg-gray-5" />
@@ -1402,7 +1475,7 @@ function Inner() {
 										>
 											<IconLucideMaximize2 class="size-4" />
 										</button>
-										<Show when={options.mode !== "screenshot"}>
+										<Show when={!isImmediateCapture()}>
 											<button
 												type="button"
 												class="flex h-9 items-center gap-1.5 rounded-xl px-2.5 text-xs font-normal transition-colors disabled:cursor-not-allowed disabled:opacity-40"
@@ -1434,7 +1507,7 @@ function Inner() {
 								style={controlsStyle()}
 							>
 								<div class="flex flex-col items-center">
-									<Show when={options.mode !== "screenshot"}>
+									<Show when={!isImmediateCapture()}>
 										<RecordingControls
 											target={{
 												variant: "area",
@@ -1479,7 +1552,7 @@ function Inner() {
 											</small>
 										</div>
 									</Show>
-									<Show when={isValid()}>
+									<Show when={isValid() && !isOcr()}>
 										<ShowCapFreeWarning
 											isInstantMode={options.mode === "instant"}
 										/>
@@ -1872,46 +1945,57 @@ function RecordingControls(props: {
 	const devices = createDevicesQuery();
 	const [noMicrophoneWarningOpen, setNoMicrophoneWarningOpen] =
 		createSignal(false);
+	const [dontShowMicrophoneWarning, setDontShowMicrophoneWarning] =
+		createSignal(false);
+	const [confirmingWithoutMicrophone, setConfirmingWithoutMicrophone] =
+		createSignal(false);
+	const [dismissingPicker, setDismissingPicker] = createSignal(false);
+	let microphoneConfirmationRevision = 0;
+	let controlsDisposed = false;
+	onCleanup(() => {
+		controlsDisposed = true;
+		microphoneConfirmationRevision += 1;
+	});
+	const dismissMicrophoneWarning = () => {
+		microphoneConfirmationRevision += 1;
+		setConfirmingWithoutMicrophone(false);
+		setNoMicrophoneWarningOpen(false);
+	};
 	const cameras = createMemo(() => devices.data?.cameras ?? []);
 	const mics = createMemo(() => devices.data?.microphones ?? []);
 	const permissions = createMemo(() => devices.data?.permissions);
-	const setMicInput = createMutation(() => ({
-		mutationFn: async (name: string | null) => {
-			const previous = rawOptions.micName ?? null;
-			if (previous !== name) setOptions("micName", name);
-			try {
-				await commands.setMicInput(name);
-			} catch (error) {
-				if (previous !== name) setOptions("micName", previous);
-				throw error;
-			}
-		},
-	}));
+	const setMicInput = createMicrophoneMutation();
 	const setCamera = createCameraMutation();
+	const [restoringInputs, setRestoringInputs] = createSignal(true);
 
 	onMount(async () => {
-		if (rawOptions.micName) {
-			setMicInput
-				.mutateAsync(rawOptions.micName)
-				.catch((error) => console.error("Failed to set mic input:", error));
-		}
+		const restoreMicrophone = rawOptions.micName
+			? commands
+					.setMicInput(rawOptions.micName)
+					.catch((error) =>
+						console.error("Failed to restore mic input:", error),
+					)
+			: Promise.resolve();
 
 		const isCameraOnly = props.target.variant === "cameraOnly";
-		if (rawOptions.cameraID && "ModelID" in rawOptions.cameraID)
-			await setCamera.mutateAsync({
-				model: { ModelID: rawOptions.cameraID.ModelID },
-				skipCameraWindow: isCameraOnly,
-			});
-		else if (rawOptions.cameraID && "DeviceID" in rawOptions.cameraID)
-			await setCamera.mutateAsync({
-				model: { DeviceID: rawOptions.cameraID.DeviceID },
-				skipCameraWindow: isCameraOnly,
-			});
+		const restoreCamera = async () => {
+			if (rawOptions.cameraID) {
+				await setCamera.rawMutate({ ...rawOptions.cameraID }, isCameraOnly);
+			}
 
-		if (isCameraOnly) {
-			const win = await getCameraWindow();
-			if (win) win.close();
-		}
+			if (isCameraOnly) {
+				const win = await getCameraWindow();
+				if (win) await win.close();
+			}
+		};
+
+		await Promise.all([
+			restoreMicrophone,
+			restoreCamera().catch((error) =>
+				console.error("Failed to restore camera input:", error),
+			),
+		]);
+		if (!controlsDisposed) setRestoringInputs(false);
 	});
 
 	const selectedCamera = createMemo(() => {
@@ -1922,6 +2006,27 @@ function RecordingControls(props: {
 	const selectedMicName = createMemo(() => {
 		if (!rawOptions.micName) return null;
 		return mics().find((name) => name === rawOptions.micName) ?? null;
+	});
+	const microphoneConfirmationContext = createMemo(() =>
+		JSON.stringify({
+			target: props.target,
+			mode: rawOptions.mode,
+			microphone: rawOptions.micName,
+			selectedMicrophone: selectedMicName(),
+			camera: rawOptions.cameraID,
+			cameraAvailable: selectedCamera() !== null,
+			systemAudio: rawOptions.captureSystemAudio,
+			targetModeSource: rawOptions.targetModeSource,
+			organizationId: rawOptions.organizationId,
+		}),
+	);
+	let previousConfirmationContext = microphoneConfirmationContext();
+	createEffect(() => {
+		const context = microphoneConfirmationContext();
+		if (context !== previousConfirmationContext) {
+			previousConfirmationContext = context;
+			dismissMicrophoneWarning();
+		}
 	});
 
 	createEffect(() => {
@@ -1938,10 +2043,16 @@ function RecordingControls(props: {
 	});
 
 	const startLoading = () =>
-		devices.isPending || recordingStartSafety.isPending;
+		dismissingPicker() ||
+		devices.isPending ||
+		recordingStartSafety.isPending ||
+		restoringInputs() ||
+		setMicInput.isPending ||
+		setCamera.isPending;
 	const startDisabled = () => !!props.disabled || startLoading();
 
 	const startRecording = async (confirmedWithoutMicrophone = false) => {
+		if (confirmingWithoutMicrophone() && !confirmedWithoutMicrophone) return;
 		if (rawOptions.mode === "instant" && !auth.data) {
 			emit("start-sign-in");
 			return;
@@ -1990,18 +2101,20 @@ function RecordingControls(props: {
 			);
 		}
 
+		setDismissingPicker(true);
+		try {
+			await commands.suspendTargetSelectOverlays();
+		} catch (error) {
+			setDismissingPicker(false);
+			toast.error("Could not dismiss the target picker. Please try again.");
+			console.error("Failed to suspend target select overlays", error);
+			return;
+		}
+		if (controlsDisposed) return;
 		props.onRecordingStart?.();
 
 		if (rawOptions.mode === "screenshot") {
 			try {
-				const allWindows = await WebviewWindow.getAll();
-				for (const win of allWindows) {
-					if (win.label.startsWith("target-select-overlay-")) {
-						await win.setIgnoreCursorEvents(true);
-						await win.hide();
-					}
-				}
-
 				const path = await commands.takeScreenshot(target);
 				const shouldOpenEditor =
 					await commands.automationShouldOpenScreenshotEditor(target);
@@ -2047,7 +2160,7 @@ function RecordingControls(props: {
 					toast.error(
 						"Selected microphone is not available. Please select a different microphone in settings.",
 					);
-				} else {
+				} else if (!isRecordingStartCancelled(e)) {
 					toast.error(`Failed to start recording: ${msg}`);
 				}
 				// An IPC-level rejection never reaches the backend, so no
@@ -2059,6 +2172,45 @@ function RecordingControls(props: {
 				});
 				void commands.closeTargetSelectOverlays();
 			});
+	};
+
+	const confirmWithoutMicrophone = async () => {
+		if (startDisabled() || confirmingWithoutMicrophone()) return;
+		const revision = ++microphoneConfirmationRevision;
+		const context = microphoneConfirmationContext();
+		setConfirmingWithoutMicrophone(true);
+		if (dontShowMicrophoneWarning()) {
+			try {
+				await recordingStartSafetyStore.set({
+					confirmBeforeRecordingWithoutMicrophone: false,
+				});
+			} catch {
+				if (controlsDisposed || revision !== microphoneConfirmationRevision)
+					return;
+				setConfirmingWithoutMicrophone(false);
+				toast.error(
+					"Could not save your preference. Try again or leave the box unchecked.",
+				);
+				return;
+			}
+		}
+		if (
+			controlsDisposed ||
+			revision !== microphoneConfirmationRevision ||
+			context !== microphoneConfirmationContext()
+		) {
+			if (!controlsDisposed && revision === microphoneConfirmationRevision) {
+				dismissMicrophoneWarning();
+			}
+			return;
+		}
+		try {
+			await startRecording(true);
+		} finally {
+			if (!controlsDisposed && revision === microphoneConfirmationRevision) {
+				setConfirmingWithoutMicrophone(false);
+			}
+		}
 	};
 
 	const menuModes = async () =>
@@ -2128,10 +2280,15 @@ function RecordingControls(props: {
 		});
 	};
 
-	function showMenu(menu: Promise<Menu>, e: UIEvent) {
+	const popupRecordingMenu = createRecordingMenuPopup();
+
+	function showMenu(createMenu: () => Promise<Menu>, e: UIEvent) {
 		e.stopPropagation();
-		const rect = (e.target as HTMLDivElement).getBoundingClientRect();
-		menu.then((menu) => menu.popup(new LogicalPosition(rect.x, rect.y + 40)));
+		const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+		void popupRecordingMenu(
+			createMenu,
+			new LogicalPosition(rect.x, rect.y + 40),
+		).catch(() => toast.error("Could not open recording menu"));
 	}
 
 	return (
@@ -2148,7 +2305,6 @@ function RecordingControls(props: {
 										targetMode: null,
 										targetModeDismissal: "cancelled",
 									});
-									commands.setEditorRecordingTarget(null);
 									commands.closeTargetSelectOverlays();
 								}
 							}}
@@ -2158,7 +2314,10 @@ function RecordingControls(props: {
 						</div>
 						<Popover
 							open={noMicrophoneWarningOpen()}
-							onOpenChange={setNoMicrophoneWarningOpen}
+							onOpenChange={(open) => {
+								if (open) setNoMicrophoneWarningOpen(true);
+								else dismissMicrophoneWarning();
+							}}
 							placement="bottom"
 							gutter={8}
 						>
@@ -2191,7 +2350,6 @@ function RecordingControls(props: {
 											{(() => {
 												if (rawOptions.mode === "instant" && !auth.data)
 													return "Sign In To Use";
-												if (startLoading()) return "Preparing...";
 												if (rawOptions.mode === "screenshot")
 													return "Take Screenshot";
 												return "Start Recording";
@@ -2202,13 +2360,14 @@ function RecordingControls(props: {
 										</span>
 									</div>
 								</div>
-								<div
+								<button
+									type="button"
+									aria-label="Choose recording mode"
 									class="pl-2.5 pr-3 py-1.5 flex items-center border-l border-white/20 bg-white/5 transition-colors group-hover:bg-white/10"
-									onMouseDown={(e) => showMenu(menuModes(), e)}
-									onClick={(e) => showMenu(menuModes(), e)}
+									onClick={(e) => showMenu(menuModes, e)}
 								>
 									<IconCapCaretDown class="pointer-events-none" />
-								</div>
+								</button>
 							</Popover.Anchor>
 							<Popover.Portal>
 								<Popover.Content class="z-200 w-[min(21rem,calc(100vw-1.5rem))] rounded-xl border border-amber-6 bg-gray-1 p-3.5 text-gray-12 shadow-xl outline-hidden data-expanded:animate-in data-expanded:fade-in data-expanded:zoom-in-95">
@@ -2224,6 +2383,19 @@ function RecordingControls(props: {
 											</p>
 										</div>
 									</div>
+									<label class="mt-3 flex cursor-pointer items-center gap-2 text-xs text-gray-11">
+										<input
+											type="checkbox"
+											class="size-3.5 accent-blue-9"
+											checked={dontShowMicrophoneWarning()}
+											onChange={(event) =>
+												setDontShowMicrophoneWarning(
+													event.currentTarget.checked,
+												)
+											}
+										/>
+										Don't show again
+									</label>
 									<div class="flex gap-2 justify-end mt-3">
 										<Popover.CloseButton class="px-3 h-8 text-xs font-medium rounded-lg border border-gray-4 bg-gray-2 text-gray-12 hover:bg-gray-3">
 											Go back
@@ -2231,7 +2403,10 @@ function RecordingControls(props: {
 										<button
 											type="button"
 											class="px-3 h-8 text-xs font-medium text-white rounded-lg bg-blue-9 hover:bg-blue-10"
-											onClick={() => void startRecording(true)}
+											onClick={() => void confirmWithoutMicrophone()}
+											disabled={
+												startDisabled() || confirmingWithoutMicrophone()
+											}
 										>
 											Record without microphone
 										</button>
@@ -2239,13 +2414,14 @@ function RecordingControls(props: {
 								</Popover.Content>
 							</Popover.Portal>
 						</Popover>
-						<div
+						<button
+							type="button"
+							aria-label="Recording countdown"
 							class="flex justify-center items-center rounded-full border transition-opacity bg-gray-6 text-gray-12 size-9 hover:opacity-80"
-							onMouseDown={(e) => showMenu(preRecordingMenu(), e)}
-							onClick={(e) => showMenu(preRecordingMenu(), e)}
+							onClick={(e) => showMenu(preRecordingMenu, e)}
 						>
 							<IconCapGear class="pointer-events-none will-change-transform size-5" />
-						</div>
+						</button>
 					</div>
 				</div>
 				<Show when={(rawOptions.mode as string) !== "screenshot"}>
